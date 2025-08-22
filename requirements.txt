@@ -1,9 +1,8 @@
 streamlit
 streamlit-folium
 folium
-geopy
-haversine
-requests
 pandas
+requests
+haversine
 timezonefinder
 pytz
