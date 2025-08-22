@@ -6,3 +6,4 @@ requests
 haversine
 timezonefinder
 pytz
+geopy
