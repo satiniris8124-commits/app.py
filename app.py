@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # 약국 찾기 (영업중 필터 포함)
 import streamlit as st
 import pandas as pd
