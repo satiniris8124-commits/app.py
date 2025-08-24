@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # 💊 약국 찾기 앱 (주소 검색 + 지도 클릭 + 결과 유지 + 영업중 필터 + 진단 출력)
 # - Overpass 미러 회전/재시도 + 상태코드/스니펫 출력
-# - 약국 태그 확장: amenity=pharmacy | healthcare=pharmacy | shop=chemist | name~약국/Pharm
+# - 약국 태그 확장: amenity=pharmacy | healthcare=pharmacy | shop=chemist | name~(약국|pharm),i
 # - 결과 0개면 반경 자동 확대 재탐색
 # - rerun 되어도 결과 유지(session_state)
 
@@ -16,30 +16,23 @@ from timezonefinder import TimezoneFinder
 from geopy.geocoders import Nominatim
 import pytz, time as _time
 
-# -----------------------------
-# 기본 UI 설정
-# -----------------------------
 st.set_page_config(page_title="약국 찾기", page_icon="💊", layout="wide")
 st.title("💊 내 주변 약국 찾기")
 
-# -----------------------------
-# 세션 기본값
-# -----------------------------
+# ---------------- Session State ----------------
 for k, v in [
-    ("last_df", None),                # 마지막 검색 결과
-    ("last_center", None),            # 마지막 검색 중심(lat, lon)
-    ("last_radius", 1200),            # 마지막 검색 반경
-    ("pending_center", None),         # 지도 클릭으로 임시 선택 중심
+    ("last_df", None),
+    ("last_center", None),
+    ("last_radius", 1200),
+    ("pending_center", None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
 
-DEFAULT_CENTER = (37.5663, 126.9779)  # 서울시청
+DEFAULT_CENTER = (37.5663, 126.9779)
 DISPLAY_COLS = ["이름","거리(m)","영업여부","영업시간","전화","네이버지도","카카오맵"]
 
-# -----------------------------
-# 타임존 유틸
-# -----------------------------
+# ---------------- Timezone ----------------
 def tz_at(lat, lon):
     try:
         tzname = TimezoneFinder().timezone_at(lat=lat, lng=lon)
@@ -49,22 +42,15 @@ def tz_at(lat, lon):
         pass
     return pytz.timezone("Asia/Seoul")
 
-# -----------------------------
-# Overpass 안정 호출 (미러 회전 + 재시도 + 진단 출력)
-# -----------------------------
+# ---------------- Overpass (diagnostic + retry) ----------------
 OVERPASS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.openstreetmap.ru/api/interpreter",
 ]
-UA = {"User-Agent": "pharmacy-open-now/1.0 (contact: you@example.com)"}  # ← 본인 이메일로 바꾸면 좋아요
+UA = {"User-Agent": "pharmacy-open-now/1.0 (contact: you@example.com)"}  # ← 이메일 바꾸면 좋아요
 
 def fetch_overpass(query, tries=6, backoff=1.6, debug=True):
-    """
-    Overpass 미러를 돌며 재시도.
-    실패 시 status/reason/본문 앞부분을 화면에 노출해 진단이 쉬움.
-    성공하면 (json, 사용한엔드포인트URL) 반환.
-    """
     last = None
     for i in range(tries):
         url = OVERPASS[i % len(OVERPASS)]
@@ -96,18 +82,14 @@ def fetch_overpass(query, tries=6, backoff=1.6, debug=True):
             continue
     raise RuntimeError(f"Overpass 요청 실패 (last={last})")
 
-# -----------------------------
-# opening_hours 파서 (일반 패턴)
-# -----------------------------
+# ---------------- opening_hours parser ----------------
 DAY = {"Mo":0,"Tu":1,"We":2,"Th":3,"Fr":4,"Sa":5,"Su":6}
-
 def _t(s):
     try:
         h, m = s.split(":")
         return time(int(h), int(m))
     except Exception:
         return None
-
 def _days(seg):
     if "-" in seg:
         a, b = seg.split("-")
@@ -115,12 +97,10 @@ def _days(seg):
             i, j = DAY[a], DAY[b]
             return list(range(i, j+1)) if i <= j else list(range(i, 7)) + list(range(0, j+1))
     return [DAY[seg]] if seg in DAY else []
-
 def _rule(s):
     m = re.match(r'^([A-Za-z]{2}(?:-[A-Za-z]{2})?(?:,\s*[A-Za-z]{2}(?:-[A-Za-z]{2})?)*)\s+'
                  r'([\d:]{4,5}-[\d:]{4,5}(?:\s*,\s*[\d:]{4,5}-[\d:]{4,5})*)$', s.strip())
-    if not m:
-        return None
+    if not m: return None
     dpart, tpart = m.groups()
     days = sorted(set(sum((_days(x.strip()) for x in dpart.split(",")), [])))
     ranges = []
@@ -128,46 +108,36 @@ def _rule(s):
         if "-" in seg:
             a, b = seg.split("-")
             ta, tb = _t(a), _t(b)
-            if ta and tb:
-                ranges.append((ta, tb))
+            if ta and tb: ranges.append((ta, tb))
     return {"days": days, "ranges": ranges} if days and ranges else None
-
 def is_open_now(oh, now_local: datetime):
-    if not oh:
-        return None, "표기 없음"
+    if not oh: return None, "표기 없음"
     s = oh.strip()
-    if s.lower() in ("24/7", "24x7", "24-7"):
-        return True, "24/7"
+    if s.lower() in ("24/7","24x7","24-7"): return True, "24/7"
     wd, nowt = now_local.weekday(), now_local.time()
     known, opened = False, False
     for part in [p.strip() for p in s.split(";") if p.strip()]:
-        if "PH" in part or "off" in part.lower():
-            continue
+        if "PH" in part or "off" in part.lower(): continue
         if re.match(r'^[\d:]{4,5}-[\d:]{4,5}$', part):
             ta, tb = _t(part.split("-")[0]), _t(part.split("-")[1])
             if ta and tb:
                 known = True
-                if ta <= nowt <= tb:
-                    opened = True
+                if ta <= nowt <= tb: opened = True
             continue
         rule = _rule(part)
-        if not rule:
-            continue
+        if not rule: continue
         known = True
         if wd in rule["days"]:
             for ta, tb in rule["ranges"]:
-                if tb < ta:  # 자정 넘어감
-                    if nowt >= ta or nowt <= tb:
-                        opened = True; break
+                if tb < ta:
+                    if nowt >= ta or nowt <= tb: opened = True; break
                 else:
-                    if ta <= nowt <= tb:
-                        opened = True; break
+                    if ta <= nowt <= tb: opened = True; break
     return (opened, oh) if known else (None, oh)
 
-# -----------------------------
-# Overpass 쿼리 (태그 확장)
-# -----------------------------
+# ---------------- Overpass query (fixed regex flags) ----------------
 def build_overpass_query(lat, lon, radius):
+    # 핵심 수정: (?i) 대신 ,i 플래그 사용 → ["name"~"...",i]
     return f"""
     [out:json][timeout:40];
     (
@@ -183,16 +153,14 @@ def build_overpass_query(lat, lon, radius):
       way ["shop"="chemist"](around:{radius},{lat},{lon});
       relation["shop"="chemist"](around:{radius},{lat},{lon});
 
-      node[name~"(?i)pharm|약국"](around:{radius},{lat},{lon});
-      way [name~"(?i)pharm|약국"](around:{radius},{lat},{lon});
-      relation[name~"(?i)pharm|약국"](around:{radius},{lat},{lon});
+      node["name"~"(pharm|약국)",i](around:{radius},{lat},{lon});
+      way ["name"~"(pharm|약국)",i](around:{radius},{lat},{lon});
+      relation["name"~"(pharm|약국)",i](around:{radius},{lat},{lon});
     );
     out center tags;
     """
 
-# -----------------------------
-# 1) 주소 검색
-# -----------------------------
+# ---------------- 1) Address search ----------------
 st.markdown("### 1) 지역(주소) 검색")
 with st.form("addr"):
     c1, c2 = st.columns([4, 1])
@@ -202,7 +170,6 @@ with st.form("addr"):
         addr_submit = st.form_submit_button("주소로 위치 지정")
 if addr_submit and addr.strip():
     try:
-        # 본인 이메일이 들어간 UA/timeout 지정
         geo = Nominatim(user_agent="pharmacy-open-now/1.0 (contact: you@example.com)", timeout=15)
         loc = geo.geocode(addr, addressdetails=False, language="ko")
         if loc:
@@ -215,12 +182,9 @@ if addr_submit and addr.strip():
     except Exception as e:
         st.error(f"Nominatim 오류: {e}")
 
-# 현재 검색 중심
 current_center = st.session_state["last_center"] or DEFAULT_CENTER
 
-# -----------------------------
-# 2) 지도에서 위치 선택 (임시 → 확정 버튼)
-# -----------------------------
+# ---------------- 2) Map select ----------------
 st.markdown("### 2) 지도에서 위치 선택 (선택 사항)")
 m = folium.Map(location=current_center, zoom_start=14, control_scale=True)
 folium.Marker(current_center, tooltip="현재 검색 중심").add_to(m)
@@ -245,9 +209,7 @@ with cB:
 
 search_center = st.session_state["last_center"] or current_center
 
-# -----------------------------
-# 3) 옵션 & 검색 실행
-# -----------------------------
+# ---------------- 3) Options & Search ----------------
 st.markdown("### 3) 검색 옵션")
 with st.form("search"):
     radius = st.slider("반경 (m)", 200, 3000, st.session_state["last_radius"], step=100)
@@ -259,13 +221,11 @@ if submit:
     tz = tz_at(lat, lon)
     now_local = datetime.now(tz)
 
-    # 1차 탐색
     query = build_overpass_query(lat, lon, radius)
     (data, used_endpoint) = fetch_overpass(query)
     elements = data.get("elements", [])
     st.caption(f"Overpass endpoint: {used_endpoint}")
 
-    # 0개면 자동 반경 확대 재탐색 (최대 3000m)
     if not elements and radius < 3000:
         alt_radius = min(3000, max(radius + 800, int(radius * 1.6)))
         st.info(f"반경 내 결과가 없어 {alt_radius}m로 자동 재탐색합니다.")
@@ -273,17 +233,15 @@ if submit:
         (data, used_endpoint) = fetch_overpass(query)
         elements = data.get("elements", [])
         st.caption(f"(재탐색) Overpass endpoint: {used_endpoint}")
-        radius = alt_radius  # 지도/세션에 반영
+        radius = alt_radius
 
-    # 결과 가공
     rows = []
     for el in elements:
         if el.get("type") == "node":
             plat, plon = el.get("lat"), el.get("lon")
         else:
             c = el.get("center")
-            if not c:
-                continue
+            if not c: continue
             plat, plon = c.get("lat"), c.get("lon")
 
         tags = el.get("tags", {}) or {}
@@ -305,13 +263,11 @@ if submit:
             "카카오맵": f"https://map.kakao.com/?q={name}",
         })
 
-    # 빈 결과여도 컬럼 뼈대 유지
     df = pd.DataFrame(
         rows,
         columns=["이름","거리(m)","영업여부","영업시간","전화","위도","경도","네이버지도","카카오맵"]
     )
 
-    # 영업중만 보기 토글 + 정렬
     if not df.empty:
         if open_only:
             df = df[df["영업여부"].astype(str) == "영업중"]
@@ -319,22 +275,19 @@ if submit:
         df["__ord__"] = df["영업여부"].map(order).fillna(9)
         df = df.sort_values(["__ord__", "거리(m)"]).drop(columns="__ord__")
 
-    # 세션 저장(결과 유지)
     st.session_state["last_df"] = df.reset_index(drop=True)
     st.session_state["last_center"] = (lat, lon)
     st.session_state["last_radius"] = radius
 
     st.success(f"검색 완료: {len(df)}곳")
 
-# -----------------------------
-# 4) 결과 출력 (항상 유지)
-# -----------------------------
+# ---------------- 4) Results (persisted) ----------------
 st.markdown("### 4) 검색 결과")
 df = st.session_state["last_df"]
 if df is None:
     st.caption("아직 검색 결과가 없어요. 주소 지정 또는 지도 클릭 후 ‘검색 실행’을 눌러주세요.")
 else:
-    cols = [c for c in DISPLAY_COLS if c in df.columns]  # 안전 표시
+    cols = [c for c in DISPLAY_COLS if c in df.columns]
     if df.empty:
         st.warning("반경 내 결과가 없습니다. 반경을 넓혀보거나 중심을 옮겨보세요.")
         st.dataframe(pd.DataFrame(columns=cols), use_container_width=True)
