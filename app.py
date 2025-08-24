@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-# 💊 약국 찾기 앱 (주소 검색 + 지도 클릭 + 결과 유지 + 영업중 필터 정확화)
-# - Overpass 미러 회전/재시도
+# 💊 약국 찾기 앱 (주소 검색 + 지도 클릭 + 결과 유지 + 영업중 필터 + 진단 출력)
+# - Overpass 미러 회전/재시도 + 상태코드/스니펫 출력
 # - 약국 태그 확장: amenity=pharmacy | healthcare=pharmacy | shop=chemist | name~약국/Pharm
 # - 결과 0개면 반경 자동 확대 재탐색
-# - Streamlit rerun에도 결과 유지(session_state)
+# - rerun 되어도 결과 유지(session_state)
 
 import streamlit as st
 import pandas as pd
@@ -29,7 +29,7 @@ for k, v in [
     ("last_df", None),                # 마지막 검색 결과
     ("last_center", None),            # 마지막 검색 중심(lat, lon)
     ("last_radius", 1200),            # 마지막 검색 반경
-    ("pending_center", None),         # 지도 클릭으로 임시 선택중인 중심
+    ("pending_center", None),         # 지도 클릭으로 임시 선택 중심
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -50,35 +50,51 @@ def tz_at(lat, lon):
     return pytz.timezone("Asia/Seoul")
 
 # -----------------------------
-# Overpass 안정 호출 (미러 회전 + 재시도)
+# Overpass 안정 호출 (미러 회전 + 재시도 + 진단 출력)
 # -----------------------------
 OVERPASS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.openstreetmap.ru/api/interpreter",
 ]
-UA = {"User-Agent": "pharmacy-open-now/1.0 (contact: you@example.com)"}
+UA = {"User-Agent": "pharmacy-open-now/1.0 (contact: you@example.com)"}  # ← 본인 이메일로 바꾸면 좋아요
 
-def fetch_overpass(query, tries=6, backoff=1.6):
-    err = None
+def fetch_overpass(query, tries=6, backoff=1.6, debug=True):
+    """
+    Overpass 미러를 돌며 재시도.
+    실패 시 status/reason/본문 앞부분을 화면에 노출해 진단이 쉬움.
+    성공하면 (json, 사용한엔드포인트URL) 반환.
+    """
+    last = None
     for i in range(tries):
         url = OVERPASS[i % len(OVERPASS)]
         try:
-            r = requests.post(url, data={"data": query}, headers=UA, timeout=45)
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.HTTPError as he:
-            code = getattr(he.response, "status_code", None)
-            if code in (429, 502, 503, 504):
-                err = he
+            r = requests.post(url, data={"data": query}, headers=UA, timeout=60)
+            code = r.status_code
+            if code != 200:
+                snippet = (r.text or "")[:300].replace("\n", " ")[:300]
+                if debug:
+                    st.warning(f"[Overpass] {url} → HTTP {code} • {r.reason} • body: {snippet}")
+                if code in (429, 500, 502, 503, 504):
+                    last = (code, r.reason, url)
+                    _time.sleep(backoff ** i)
+                    continue
+                raise requests.exceptions.HTTPError(f"HTTP {code} {r.reason} @ {url}")
+            try:
+                return r.json(), url
+            except Exception as je:
+                if debug:
+                    st.warning(f"[Overpass] {url} → 200 but JSON parse fail: {je}")
+                last = (200, "JSON parse fail", url)
                 _time.sleep(backoff ** i)
                 continue
-            raise
-        except Exception as e:
-            err = e
+        except requests.exceptions.RequestException as e:
+            last = (None, "RequestException", str(e), url)
+            if debug:
+                st.warning(f"[Overpass] {url} → RequestException: {e}")
             _time.sleep(backoff ** i)
             continue
-    raise RuntimeError(f"Overpass 실패: {err}")
+    raise RuntimeError(f"Overpass 요청 실패 (last={last})")
 
 # -----------------------------
 # opening_hours 파서 (일반 패턴)
@@ -186,15 +202,18 @@ with st.form("addr"):
         addr_submit = st.form_submit_button("주소로 위치 지정")
 if addr_submit and addr.strip():
     try:
-        geo = Nominatim(user_agent="pharmacy-open-now/1.0 (contact: you@example.com)")
-        loc = geo.geocode(addr)
+        # 본인 이메일이 들어간 UA/timeout 지정
+        geo = Nominatim(user_agent="pharmacy-open-now/1.0 (contact: you@example.com)", timeout=15)
+        loc = geo.geocode(addr, addressdetails=False, language="ko")
         if loc:
             st.session_state["last_center"] = (loc.latitude, loc.longitude)
             st.success(f"위치 설정: {loc.address}")
         else:
             st.warning("주소를 찾지 못했어요. 다른 표현으로 시도해보세요.")
+    except requests.exceptions.HTTPError as he:
+        st.error(f"Nominatim HTTP 오류: {he}")
     except Exception as e:
-        st.error(f"지오코딩 오류: {e}")
+        st.error(f"Nominatim 오류: {e}")
 
 # 현재 검색 중심
 current_center = st.session_state["last_center"] or DEFAULT_CENTER
@@ -242,16 +261,18 @@ if submit:
 
     # 1차 탐색
     query = build_overpass_query(lat, lon, radius)
-    data = fetch_overpass(query)
+    (data, used_endpoint) = fetch_overpass(query)
     elements = data.get("elements", [])
+    st.caption(f"Overpass endpoint: {used_endpoint}")
 
     # 0개면 자동 반경 확대 재탐색 (최대 3000m)
     if not elements and radius < 3000:
         alt_radius = min(3000, max(radius + 800, int(radius * 1.6)))
         st.info(f"반경 내 결과가 없어 {alt_radius}m로 자동 재탐색합니다.")
         query = build_overpass_query(lat, lon, alt_radius)
-        data = fetch_overpass(query)
+        (data, used_endpoint) = fetch_overpass(query)
         elements = data.get("elements", [])
+        st.caption(f"(재탐색) Overpass endpoint: {used_endpoint}")
         radius = alt_radius  # 지도/세션에 반영
 
     # 결과 가공
@@ -290,11 +311,10 @@ if submit:
         columns=["이름","거리(m)","영업여부","영업시간","전화","위도","경도","네이버지도","카카오맵"]
     )
 
-    # 영업중만 보기 토글
+    # 영업중만 보기 토글 + 정렬
     if not df.empty:
         if open_only:
             df = df[df["영업여부"].astype(str) == "영업중"]
-        # 정렬: 영업중 → 확인필요 → 영업종료 → 거리
         order = {"영업중": 0, "확인필요": 1, "영업종료": 2}
         df["__ord__"] = df["영업여부"].map(order).fillna(9)
         df = df.sort_values(["__ord__", "거리(m)"]).drop(columns="__ord__")
